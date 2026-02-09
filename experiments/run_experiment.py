@@ -1,5 +1,5 @@
 """
-统一实验入口 — 一个脚本跑一个实验
+统一实验入口 �?一个脚本跑一个实�?
 
 用法:
     python -m experiments.run_experiment \
@@ -12,8 +12,8 @@
     --generator   G1/G2/G3/G4
     --method      dr/paired/atpc
     --seed        随机种子
-    --upload_url  上传地址 (可选, HTTP POST)
-    --scp_target  SCP 上传目标 (可选, user@host:/path)
+    --upload_url  上传地址 (可�? HTTP POST)
+    --scp_target  SCP 上传目标 (可�? user@host:/path)
 """
 import os
 import sys
@@ -23,11 +23,11 @@ import argparse
 import copy
 from datetime import datetime
 
-# 确保项目根目录在 path 中
+# 确保项目根目录在 path �?
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-import isaacgym  # 必须先导入
+import isaacgym  # 必须先导�?
 
 import torch
 import numpy as np
@@ -41,14 +41,27 @@ from experiments.generators import get_generator, make_generator_network, BaseTe
 from experiments.uploader import ResultUploader
 
 
+def _json_default(obj):
+    """JSON 序列�? 处理 Tensor / numpy 类型"""
+    if isinstance(obj, torch.Tensor):
+        return obj.item() if obj.numel() == 1 else obj.tolist()
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+
 # ============================================================
 # 可插拔生成器的对抗训练器
 # ============================================================
 
 class PluggableAdversarialTrainer:
     """
-    在 AdversarialCurriculumTrainer 基础上，
-    将内部固定的 TerrainGenerator 替换为 experiments.generators 中的任意生成器。
+    �?AdversarialCurriculumTrainer 基础上，
+    将内部固定的 TerrainGenerator 替换�?experiments.generators 中的任意生成器�?
     """
 
     def __init__(
@@ -75,7 +88,7 @@ class PluggableAdversarialTrainer:
             self.gen_net.parameters(), lr=c["generator_lr"]
         )
 
-        # 输入构建器 (复用原有逻辑)
+        # 输入构建�?(复用原有逻辑)
         from legged_gym.curriculum.generator import GeneratorInputBuilder
         self.input_builder = GeneratorInputBuilder(device=device)
 
@@ -83,7 +96,7 @@ class PluggableAdversarialTrainer:
         self.antagonist = None
         self.antagonist_ema = 0.99
 
-        # 新颖性检测
+        # 新颖性检�?
         self.use_novelty = c.get("use_novelty", True)
         self.novelty_threshold = c["novelty_threshold"]
         self.trajectory_buffer = []
@@ -100,7 +113,7 @@ class PluggableAdversarialTrainer:
         self.warmup_done = False
         self.warmup_count = 0
 
-        # 可行性过滤
+        # 可行性过�?
         from legged_gym.curriculum.adversarial_trainer import FeasibilityFilter
         self.feasibility_filter = FeasibilityFilter()
 
@@ -139,7 +152,7 @@ class PluggableAdversarialTrainer:
         traj = torch.stack(obs_list).flatten()
         return total_r / num_steps, traj
 
-    # ------ 新颖性 ------
+    # ------ 新颖�?------
     def _check_novelty(self, traj):
         if not self.use_novelty or len(self.trajectory_buffer) == 0:
             return True, 0.0
@@ -158,12 +171,12 @@ class PluggableAdversarialTrainer:
         if len(self.trajectory_buffer) > self.max_buffer_size:
             self.trajectory_buffer.pop(0)
 
-    # ------ 应用参数到环境 ------
+    # ------ 应用参数到环�?------
     def _apply_params(self, params_dict):
         """将生成器输出的参数应用到 env"""
         self.terrain_gen.apply_to_env(self.env, params_dict.get("terrain_type", 0), params_dict)
         cfg = self.env.cfg
-        # difficulty → terrain scale
+        # difficulty �?terrain scale
         diff = params_dict.get("difficulty", 0.5)
         if hasattr(cfg, "terrain") and hasattr(cfg.terrain, "difficulty_scale"):
             cfg.terrain.difficulty_scale = diff
@@ -190,7 +203,7 @@ class PluggableAdversarialTrainer:
             self._decay_easy()
             return params, True, False, "EASY"
 
-        # 生成器
+        # 生成�?
         self.gen_net.eval()
         for _ in range(5):
             with torch.no_grad():
@@ -298,7 +311,7 @@ class PluggableAdversarialTrainer:
 
 
 # ============================================================
-# DR Baseline Runner (无对抗，纯 PPO + Domain Randomization)
+# DR Baseline Runner (无对抗，�?PPO + Domain Randomization)
 # ============================================================
 
 class DRBaselineRunner:
@@ -316,11 +329,11 @@ class DRBaselineRunner:
         return {"source": "DR", "solver_reward": 0, "regret": 0}
 
     def save(self, path=None):
-        pass  # DR 没有额外状态
+        pass  # DR 没有额外状�?
 
 
 # ============================================================
-# 主训练循环
+# 主训练循�?
 # ============================================================
 
 def run_one_experiment(args):
@@ -355,7 +368,7 @@ def run_one_experiment(args):
             "train_cfg": cfg, "method_cfg": method_cfg,
         }, f, indent=2, default=str)
 
-    # 上传器
+    # 上传�?
     uploader = None
     if args.upload:
         uploader = ResultUploader(experiment_id=experiment_id)
@@ -393,7 +406,7 @@ def run_one_experiment(args):
     train_cfg_dict = class_to_dict(train_cfg)
     ppo_runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.device)
 
-    # 创建训练器 (根据方法)
+    # 创建训练�?(根据方法)
     if args.method == "dr":
         trainer = DRBaselineRunner(env, ppo_runner, log_dir)
         use_adversarial = False
@@ -415,7 +428,7 @@ def run_one_experiment(args):
     obs, critic_obs = obs.to(device), critic_obs.to(device)
     ppo_runner.alg.actor_critic.train()
 
-    # 随机初始化 episode 长度
+    # 随机初始�?episode 长度
     env.episode_length_buf = torch.randint_like(
         env.episode_length_buf, high=int(env.max_episode_length)
     )
@@ -468,13 +481,13 @@ def run_one_experiment(args):
                 trainer.save()
             # 保存训练统计
             with open(os.path.join(log_dir, "training_stats.json"), "w") as f:
-                json.dump(stats_log, f)
+                json.dump(stats_log, f, default=_json_default)
 
         # --- 上传 ---
         if uploader and it > 0 and it % cfg["upload_interval"] == 0:
             ppo_runner.save(os.path.join(log_dir, f"model_{it}.pt"))
             with open(os.path.join(log_dir, "training_stats.json"), "w") as f:
-                json.dump(stats_log, f)
+                json.dump(stats_log, f, default=_json_default)
             uploader.upload_checkpoint(log_dir, it)
 
     # ============ 训练结束 ============
@@ -482,11 +495,11 @@ def run_one_experiment(args):
     if use_adversarial:
         trainer.save(os.path.join(log_dir, "adversarial_final.pt"))
     with open(os.path.join(log_dir, "training_stats.json"), "w") as f:
-        json.dump(stats_log, f)
+        json.dump(stats_log, f, default=_json_default)
 
     total_time = time.time() - start_time
     print(f"\n{'='*70}")
-    print(f"  {experiment_id} DONE — {total_time/60:.1f} min")
+    print(f"  {experiment_id} DONE �?{total_time/60:.1f} min")
     print(f"  Saved to: {log_dir}")
     print(f"{'='*70}")
 
@@ -512,7 +525,7 @@ def main():
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--upload", action="store_true", default=True,
-                        help="上传结果到服务器 (默认开启)")
+                        help="上传结果到服务器 (默认开�?")
     parser.add_argument("--no_upload", action="store_true",
                         help="禁用上传")
     args = parser.parse_args()
