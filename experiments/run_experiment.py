@@ -4,7 +4,7 @@ Unified experiment entry point - one script runs one experiment.
 Usage:
     python -m experiments.run_experiment \
         --generator G1 --method atpc --seed 42 \
-        --max_iterations 2000 --num_envs 512 --headless
+        --max_iterations 2000 --headless
 """
 import os
 import sys
@@ -74,7 +74,6 @@ class PluggableAdversarialTrainer:
         self.iteration = 0
         self.accepted = 0
         self.rejected = 0
-        self.stats_history = []
 
     def _init_antagonist(self):
         self.antagonist = copy.deepcopy(self.ppo_runner.alg.actor_critic)
@@ -113,8 +112,7 @@ class PluggableAdversarialTrainer:
         norms = stack / (stack.norm(dim=1, keepdim=True) + 1e-8)
         sims = torch.mv(norms, tn)
         sims = (sims + 1) / 2
-        max_sim = sims.max().item()
-        return max_sim < self.novelty_threshold, max_sim
+        return sims.max().item() < self.novelty_threshold, sims.max().item()
 
     def _add_to_buffer(self, traj):
         self.trajectory_buffer.append(traj.detach())
@@ -127,3 +125,272 @@ class PluggableAdversarialTrainer:
         diff = params_dict.get("difficulty", 0.5)
         if hasattr(cfg, "terrain") and hasattr(cfg.terrain, "difficulty_scale"):
             cfg.terrain.difficulty_scale = diff
+
+    def generate_and_apply(self):
+        if not self.warmup_done and self.warmup_count < self.warmup_iters:
+            self.warmup_count += 1
+            if self.warmup_count >= self.warmup_iters:
+                self.warmup_done = True
+            params = self._random_easy_params()
+            params["difficulty"] = float(np.random.uniform(0.1, 0.5))
+            params["terrain_type"] = int(np.random.randint(0, self.terrain_gen.num_terrain_types))
+            self._apply_params(params)
+            return params, False, True, "WARMUP"
+        if np.random.random() < self.current_easy_prob:
+            self.easy_count += 1
+            params = self._random_easy_params()
+            self._apply_params(params)
+            self._decay_easy()
+            return params, True, False, "EASY"
+        self.gen_net.eval()
+        for _ in range(5):
+            with torch.no_grad():
+                cond = self.input_builder.build(batch_size=1)
+                t_type, p_vec, lp = self.gen_net(cond, deterministic=False)
+            params = self.gen_net.to_params_dict(p_vec)
+            if isinstance(params, list):
+                params = params[0]
+            params["terrain_type"] = int(t_type.item())
+            ok, _ = self.feasibility_filter.is_feasible(params)
+            if ok:
+                self._apply_params(params)
+                self._decay_easy()
+                self._last_lp = lp
+                return params, False, False, "GENERATOR"
+        params = self._random_easy_params()
+        self._apply_params(params)
+        self._decay_easy()
+        self._last_lp = None
+        return params, True, False, "FALLBACK"
+
+    def _random_easy_params(self):
+        return {
+            "terrain_type": 0,
+            "difficulty": float(np.random.uniform(0.05, 0.15)),
+            "friction": float(np.random.uniform(0.9, 1.1)),
+            "push_magnitude": float(np.random.uniform(0.0, 0.1)),
+            "added_mass": float(np.random.uniform(-0.2, 0.2)),
+        }
+
+    def _decay_easy(self):
+        self.current_easy_prob = max(self.min_easy_prob,
+                                     self.current_easy_prob * self.easy_decay)
+
+    def compute_and_update(self, params, is_easy, is_warmup, source):
+        self.iteration += 1
+        sol_r, sol_traj = self._evaluate_policy(self.ppo_runner.alg.actor_critic, num_steps=24)
+        if is_warmup:
+            return {"solver_reward": sol_r, "regret": 0, "gen_loss": 0,
+                    "is_novel": True, "accept_rate": 0, "source": source,
+                    "easy_prob": self.current_easy_prob, **params}
+        if self.antagonist is None:
+            self._init_antagonist()
+        ant_r, _ = self._evaluate_policy(self.antagonist, num_steps=24)
+        regret = ant_r - sol_r
+        gen_loss = 0.0
+        is_novel = True
+        if not is_easy and source != "FALLBACK":
+            is_novel, _ = self._check_novelty(sol_traj)
+            if is_novel:
+                self.accepted += 1
+                self._add_to_buffer(sol_traj)
+                gen_loss = self._update_generator(regret)
+            else:
+                self.rejected += 1
+        self._update_antagonist()
+        self.input_builder.update(sol_r, ant_r, params.get("difficulty", 0.5))
+        ar = self.accepted / max(self.accepted + self.rejected, 1)
+        return {"solver_reward": sol_r, "antagonist_reward": ant_r,
+                "regret": regret, "gen_loss": gen_loss,
+                "is_novel": is_novel, "accept_rate": ar, "source": source,
+                "easy_prob": self.current_easy_prob, **params}
+
+    def _update_generator(self, regret):
+        self.gen_net.train()
+        cond = self.input_builder.build(batch_size=1)
+        _, _, lp = self.gen_net(cond, deterministic=False)
+        loss = -regret * lp.mean()
+        entropy = self.gen_net.get_entropy(cond).mean()
+        loss = loss - 0.02 * entropy
+        self.gen_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.gen_net.parameters(), 0.5)
+        self.gen_optimizer.step()
+        return loss.item()
+
+    def save(self, path=None):
+        if path is None:
+            path = os.path.join(self.log_dir, "adversarial_state.pt")
+        torch.save({"iteration": self.iteration,
+                     "gen_net": self.gen_net.state_dict(),
+                     "gen_opt": self.gen_optimizer.state_dict(),
+                     "accepted": self.accepted, "rejected": self.rejected}, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        self.iteration = ckpt["iteration"]
+        self.gen_net.load_state_dict(ckpt["gen_net"])
+        self.gen_optimizer.load_state_dict(ckpt["gen_opt"])
+        self.accepted = ckpt.get("accepted", 0)
+        self.rejected = ckpt.get("rejected", 0)
+
+
+class DRBaselineRunner:
+    def __init__(self, env, ppo_runner, log_dir):
+        self.env = env
+        self.ppo_runner = ppo_runner
+        self.log_dir = log_dir
+        self.iteration = 0
+
+    def step_curriculum(self):
+        self.iteration += 1
+        return {"source": "DR", "solver_reward": 0, "regret": 0}
+
+    def save(self, path=None):
+        pass
+
+
+def run_one_experiment(args):
+    method_cfg = METHODS[args.method]
+    gen = get_generator(args.generator)
+    cfg = TRAIN_CFG.copy()
+    experiment_id = f"{args.method}-{args.generator}-seed{args.seed}"
+    print("=" * 70)
+    print(f"  Experiment: {experiment_id}")
+    print(f"  Method: {method_cfg['name']}")
+    print(f"  Generator: {args.generator} ({gen.name}, {gen.param_dim}D, {gen.num_terrain_types} types)")
+    print(f"  Seed: {args.seed}, Iterations: {args.max_iterations}")
+    print("=" * 70)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    log_dir = os.path.join("logs", "experiments", f"{experiment_id}_{timestamp}")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "experiment_config.json"), "w") as f:
+        json.dump({"method": args.method, "generator": args.generator,
+                    "seed": args.seed, "max_iterations": args.max_iterations,
+                    "train_cfg": cfg, "method_cfg": method_cfg}, f, indent=2, default=str)
+    uploader = None
+    if args.upload:
+        uploader = ResultUploader(experiment_id=experiment_id)
+    task_name = f"go2_{method_cfg['task_suffix']}"
+    from isaacgym import gymapi
+
+    class EnvArgs:
+        task = task_name
+        headless = args.headless
+        num_envs = cfg["num_envs"]
+        sim_device = args.device
+        rl_device = args.device
+        physics_engine = gymapi.SIM_PHYSX
+        use_gpu = True
+        subscenes = 0
+        num_threads = 0
+        use_gpu_pipeline = True
+        seed = args.seed
+        resume = False
+        experiment_name = experiment_id
+        run_name = experiment_id
+        load_run = None
+        checkpoint = None
+        max_iterations = args.max_iterations
+
+    env, env_cfg = task_registry.make_env(name=task_name, args=EnvArgs())
+    from rsl_rl.runners import OnPolicyRunner
+    _, train_cfg = task_registry.get_cfgs(name=task_name)
+    train_cfg.runner.max_iterations = args.max_iterations
+    train_cfg_dict = class_to_dict(train_cfg)
+    ppo_runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.device)
+    if args.method == "dr":
+        trainer = DRBaselineRunner(env, ppo_runner, log_dir)
+        use_adversarial = False
+    else:
+        use_novelty = method_cfg["use_novelty"]
+        cfg["use_novelty"] = use_novelty
+        trainer = PluggableAdversarialTrainer(
+            env=env, ppo_runner=ppo_runner, terrain_generator=gen,
+            device=args.device, cfg=cfg, log_dir=log_dir)
+        use_adversarial = True
+    device = args.device
+    obs = env.get_observations()
+    priv_obs = env.get_privileged_observations()
+    critic_obs = priv_obs if priv_obs is not None else obs
+    obs, critic_obs = obs.to(device), critic_obs.to(device)
+    ppo_runner.alg.actor_critic.train()
+    env.episode_length_buf = torch.randint_like(
+        env.episode_length_buf, high=int(env.max_episode_length))
+    stats_log = []
+    start_time = time.time()
+    curriculum_freq = cfg["curriculum_update_freq"]
+    for it in range(args.max_iterations):
+        cur_stats = {}
+        if use_adversarial and it % curriculum_freq == 0:
+            params, is_easy, is_warmup, source = trainer.generate_and_apply()
+            cur_stats = trainer.compute_and_update(params, is_easy, is_warmup, source)
+        with torch.inference_mode():
+            for _ in range(ppo_runner.num_steps_per_env):
+                actions = ppo_runner.alg.act(obs, critic_obs)
+                obs, priv_obs, rewards, dones, infos = env.step(actions)
+                critic_obs = priv_obs if priv_obs is not None else obs
+                obs, critic_obs = obs.to(device), critic_obs.to(device)
+                ppo_runner.alg.process_env_step(rewards, dones, infos)
+            ppo_runner.alg.compute_returns(critic_obs)
+        v_loss, s_loss = ppo_runner.alg.update()
+        ep = env.extras.get("episode", {})
+        mean_rew = ep.get("rew_tracking_lin_vel", 0)
+        entry = {"iter": it, "reward": float(mean_rew) if isinstance(mean_rew, (int, float)) else 0,
+                 "v_loss": float(v_loss), "s_loss": float(s_loss), **cur_stats}
+        stats_log.append(entry)
+        if it % 50 == 0:
+            elapsed = time.time() - start_time
+            eta = (args.max_iterations - it) * elapsed / max(it, 1)
+            src = cur_stats.get("source", "DR")
+            reg = cur_stats.get("regret", 0)
+            ar = cur_stats.get("accept_rate", 0)
+            print(f"[{it}/{args.max_iterations}] rew={mean_rew:.3f} "
+                  f"src={src} regret={reg:.3f} AR={ar:.1%} "
+                  f"time={elapsed:.0f}s ETA={eta/60:.1f}m")
+        if it > 0 and it % cfg["save_interval"] == 0:
+            ppo_runner.save(os.path.join(log_dir, f"model_{it}.pt"))
+            if use_adversarial:
+                trainer.save()
+            with open(os.path.join(log_dir, "training_stats.json"), "w") as f:
+                json.dump(stats_log, f, default=_json_default)
+        if uploader and it > 0 and it % cfg["upload_interval"] == 0:
+            ppo_runner.save(os.path.join(log_dir, f"model_{it}.pt"))
+            with open(os.path.join(log_dir, "training_stats.json"), "w") as f:
+                json.dump(stats_log, f, default=_json_default)
+            uploader.upload_checkpoint(log_dir, it)
+    ppo_runner.save(os.path.join(log_dir, "model_final.pt"))
+    if use_adversarial:
+        trainer.save(os.path.join(log_dir, "adversarial_final.pt"))
+    with open(os.path.join(log_dir, "training_stats.json"), "w") as f:
+        json.dump(stats_log, f, default=_json_default)
+    total_time = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"  {experiment_id} DONE - {total_time/60:.1f} min")
+    print(f"  Saved to: {log_dir}")
+    print(f"{'='*70}")
+    if uploader:
+        uploader.upload_final(log_dir)
+    return log_dir
+
+
+def main():
+    parser = argparse.ArgumentParser(description="AT-PC experiment")
+    parser.add_argument("--generator", type=str, required=True, choices=["G1", "G2", "G3", "G4"])
+    parser.add_argument("--method", type=str, required=True, choices=["dr", "paired", "atpc"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_iterations", type=int, default=TRAIN_CFG["max_iterations"])
+    parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--upload", action="store_true", default=True)
+    parser.add_argument("--no_upload", action="store_true")
+    args = parser.parse_args()
+    if args.no_upload:
+        args.upload = False
+    run_one_experiment(args)
+
+
+if __name__ == "__main__":
+    main()
