@@ -359,6 +359,12 @@ def run_one_experiment(args):
             print(f"[{it}/{args.max_iterations}] rew={mean_rew:.3f} "
                   f"src={src} regret={reg:.3f} AR={ar:.1%} "
                   f"time={elapsed:.0f}s ETA={eta/60:.1f}m")
+            # Upload lightweight stats JSON every 50 iters
+            if uploader:
+                stats_path = os.path.join(log_dir, "training_stats.json")
+                with open(stats_path, "w") as f:
+                    json.dump(stats_log, f, default=_json_default)
+                uploader.upload_file(stats_path)
         if it > 0 and it % cfg["save_interval"] == 0:
             ppo_runner.save(os.path.join(log_dir, f"model_{it}.pt"))
             if use_adversarial:
