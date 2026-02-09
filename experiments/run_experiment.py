@@ -76,7 +76,16 @@ class PluggableAdversarialTrainer:
         self.rejected = 0
 
     def _init_antagonist(self):
-        self.antagonist = copy.deepcopy(self.ppo_runner.alg.actor_critic)
+        ac = self.ppo_runner.alg.actor_critic
+        # Detach all params, deepcopy, then re-attach
+        ac.eval()
+        sd = {k: v.clone().detach() for k, v in ac.state_dict().items()}
+        # Build a new model with same architecture via save/load trick
+        import io
+        buf = io.BytesIO()
+        torch.save(ac, buf)
+        buf.seek(0)
+        self.antagonist = torch.load(buf, map_location=self.device)
         self.antagonist.eval()
 
     def _update_antagonist(self):
