@@ -53,6 +53,7 @@ class PluggableAdversarialTrainer:
         self.terrain_gen = terrain_generator
         c = cfg or TRAIN_CFG
         self.gen_net = make_generator_network(terrain_generator, condition_dim=16, device=device)
+        self.gen_net.reset_lstm(batch_size=1)
         self.gen_optimizer = torch.optim.Adam(self.gen_net.parameters(), lr=c["generator_lr"])
         from legged_gym.curriculum.generator import GeneratorInputBuilder
         self.input_builder = GeneratorInputBuilder(device=device)
@@ -330,12 +331,32 @@ def run_one_experiment(args):
         env.episode_length_buf, high=int(env.max_episode_length))
     stats_log = []
     start_time = time.time()
-    curriculum_freq = cfg["curriculum_update_freq"]
+    # PAIRED/ReMiDi original code uses freq=20, adversarial uses freq=10
+    if args.method == "atpc":
+        curriculum_freq = cfg["curriculum_update_freq"]  # 10
+    elif args.method == "paired":
+        curriculum_freq = 20  # match original PAIRED
+    else:
+        curriculum_freq = cfg["curriculum_update_freq"]
     for it in range(args.max_iterations):
         cur_stats = {}
         if use_adversarial and it % curriculum_freq == 0:
             params, is_easy, is_warmup, source = trainer.generate_and_apply()
             cur_stats = trainer.compute_and_update(params, is_easy, is_warmup, source)
+        # DR baseline: also evaluate solver periodically for fair comparison
+        if not use_adversarial and it % 50 == 0:
+            with torch.no_grad():
+                policy = ppo_runner.alg.actor_critic
+                policy.eval()
+                eval_obs = env.get_observations()
+                eval_r = 0.0
+                for _ in range(24):
+                    act = policy.act_inference(eval_obs)
+                    eval_obs, _, rew, _, _ = env.step(act)
+                    eval_r += rew.mean().item()
+                policy.train()
+            cur_stats["solver_reward"] = eval_r / 24
+            cur_stats["source"] = "DR"
         with torch.inference_mode():
             for _ in range(ppo_runner.num_steps_per_env):
                 actions = ppo_runner.alg.act(obs, critic_obs)
@@ -346,8 +367,27 @@ def run_one_experiment(args):
             ppo_runner.alg.compute_returns(critic_obs)
         v_loss, s_loss = ppo_runner.alg.update()
         ep = env.extras.get("episode", {})
-        mean_rew = ep.get("rew_tracking_lin_vel", 0)
-        entry = {"iter": it, "reward": float(mean_rew) if isinstance(mean_rew, (int, float)) else 0,
+        # Use total reward from episode sums, not specific reward component
+        mean_rew = 0.0
+        if ep:
+            # Try common reward keys
+            for key in ["rew_tracking_lin_vel", "reward", "r"]:
+                if key in ep:
+                    val = ep[key]
+                    mean_rew = float(val) if isinstance(val, (int, float)) else 0.0
+                    break
+            if mean_rew == 0.0 and ep:
+                # Use first available reward key
+                for key, val in ep.items():
+                    if key.startswith("rew_") and isinstance(val, (int, float)):
+                        mean_rew = float(val)
+                        break
+        # Also compute reward from env step rewards directly
+        step_reward = env.rew_buf.mean().item() if hasattr(env, 'rew_buf') else 0.0
+        # Log available episode keys on first iteration
+        if it == 0 and ep:
+            print(f"[DEBUG] Available episode keys: {list(ep.keys())}")
+        entry = {"iter": it, "reward": float(mean_rew), "step_reward": float(step_reward),
                  "v_loss": float(v_loss), "s_loss": float(s_loss), **cur_stats}
         stats_log.append(entry)
         if it % 50 == 0:
@@ -356,7 +396,7 @@ def run_one_experiment(args):
             src = cur_stats.get("source", "DR")
             reg = cur_stats.get("regret", 0)
             ar = cur_stats.get("accept_rate", 0)
-            print(f"[{it}/{args.max_iterations}] rew={mean_rew:.3f} "
+            print(f"[{it}/{args.max_iterations}] rew={step_reward:.3f} "
                   f"src={src} regret={reg:.3f} AR={ar:.1%} "
                   f"time={elapsed:.0f}s ETA={eta/60:.1f}m")
             # Upload lightweight stats JSON every 50 iters

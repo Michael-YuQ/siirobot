@@ -378,11 +378,13 @@ def make_generator_network(generator: BaseTerrainGenerator, condition_dim=16, de
 class _UnifiedGeneratorNet(nn.Module):
     """统一的生成器网络，适配任意参数空间维度"""
 
-    def __init__(self, condition_dim, n_types, n_continuous, param_mins, param_maxs, param_names):
+    def __init__(self, condition_dim, n_types, n_continuous, param_mins, param_maxs, param_names,
+                 use_lstm=True, lstm_hidden_size=64):
         super().__init__()
         self.n_types = n_types
         self.n_continuous = n_continuous
         self.param_names = param_names
+        self.use_lstm = use_lstm
         self.register_buffer("param_mins", param_mins)
         self.register_buffer("param_maxs", param_maxs)
 
@@ -392,8 +394,16 @@ class _UnifiedGeneratorNet(nn.Module):
             nn.Linear(128, 64),
             nn.ELU(),
         )
-        self.type_head = nn.Linear(64, n_types)
-        self.param_mean = nn.Linear(64, n_continuous)
+
+        # LSTM for generation history memory (matches original code)
+        feat_dim = 64
+        if use_lstm:
+            self.lstm = nn.LSTM(64, lstm_hidden_size, batch_first=True)
+            self.lstm_hidden = None
+            feat_dim = lstm_hidden_size
+
+        self.type_head = nn.Linear(feat_dim, n_types)
+        self.param_mean = nn.Linear(feat_dim, n_continuous)
         self.param_logstd = nn.Parameter(torch.zeros(n_continuous))
 
         for m in self.modules():
@@ -401,8 +411,21 @@ class _UnifiedGeneratorNet(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=0.01)
                 nn.init.constant_(m.bias, 0)
 
+    def reset_lstm(self, batch_size=1):
+        if self.use_lstm:
+            device = next(self.parameters()).device
+            self.lstm_hidden = (
+                torch.zeros(1, batch_size, self.lstm.hidden_size, device=device),
+                torch.zeros(1, batch_size, self.lstm.hidden_size, device=device),
+            )
+
     def forward(self, condition, deterministic=False):
         feat = self.backbone(condition)
+
+        if self.use_lstm:
+            feat = feat.unsqueeze(1)  # [B, 1, 64]
+            feat, self.lstm_hidden = self.lstm(feat, self.lstm_hidden)
+            feat = feat.squeeze(1)
 
         type_logits = self.type_head(feat)
         type_dist = Categorical(logits=type_logits)
@@ -423,6 +446,10 @@ class _UnifiedGeneratorNet(nn.Module):
 
     def get_entropy(self, condition):
         feat = self.backbone(condition)
+        if self.use_lstm:
+            feat = feat.unsqueeze(1)
+            feat, _ = self.lstm(feat, self.lstm_hidden)
+            feat = feat.squeeze(1)
         te = Categorical(logits=self.type_head(feat)).entropy()
         raw_mean = self.param_mean(feat)
         std = torch.exp(self.param_logstd).expand_as(raw_mean)

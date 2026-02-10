@@ -21,3 +21,11 @@ Thumbs.db
 
 # IsaacGym
 *.so
+downloaded_results/
+analysis_results.tar.gz
+analyze_local.py
+analyze_stats.py
+downloaded_results/
+analysis_results.tar.gz
+analyze_local.py
+analyze_stats.py
