@@ -50,14 +50,20 @@ def load_all_results(results_dir):
         # 加载评估结果
         eval_path = os.path.join(dirpath, "eval_results.json")
         if os.path.exists(eval_path):
-            with open(eval_path) as f:
-                entry["eval"] = json.load(f)
+            try:
+                with open(eval_path) as f:
+                    entry["eval"] = json.load(f)
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"  WARN: corrupt eval JSON in {dirname}: {e}")
 
         # 加载训练统计
         stats_path = os.path.join(dirpath, "training_stats.json")
         if os.path.exists(stats_path):
-            with open(stats_path) as f:
-                entry["stats"] = json.load(f)
+            try:
+                with open(stats_path) as f:
+                    entry["stats"] = json.load(f)
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"  WARN: corrupt stats JSON in {dirname}: {e}")
 
         data[(method, gen, seed)] = entry
 
