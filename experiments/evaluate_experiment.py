@@ -17,14 +17,15 @@ import os
 import sys
 import json
 import argparse
-import numpy as np
-import torch
 from datetime import datetime
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 import isaacgym
+
+import torch
+import numpy as np
 
 from legged_gym.envs import *
 from legged_gym.utils import task_registry
