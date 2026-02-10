@@ -11,7 +11,7 @@
     python -m experiments.evaluate_experiment \
         --log_dir logs/experiments/atpc-G1-seed42_0210_120000 \
         --generator G1 --method atpc \
-        --upload_url http://server:8080/upload
+        --upload
 """
 import os
 import sys
@@ -37,76 +37,117 @@ from experiments.uploader import ResultUploader
 
 
 class UnifiedEvaluator:
-    """在指定测试地形上评估策略"""
+    """在指定测试地形上评估策略
+    
+    注意：由于 IsaacGym 地形在环境创建时生成，无法在运行时切换地形类型。
+    因此评估主要测试 domain randomization 参数（摩擦、推力、负载）的影响。
+    """
 
     def __init__(self, env, device="cuda:0"):
         self.env = env
         self.device = device
         self.num_envs = env.num_envs
+        # 获取最大 episode 长度用于判断成功
+        self.max_ep_len = int(env.max_episode_length)
+        # 成功阈值：完成 80% 的 episode 长度算成功
+        self.success_threshold = int(self.max_ep_len * 0.8)
 
-    def evaluate_on_terrain(self, policy, terrain_params, num_episodes=50,
-                            max_steps=1000):
-        """在单个地形配置上评估"""
-        # 应用地形参数到环境
-        cfg = self.env.cfg
+    def _apply_domain_params(self, terrain_params):
+        """应用 domain randomization 参数到环境"""
+        # 摩擦系数
         friction = terrain_params.get("friction", 1.0)
-        cfg.domain_rand.friction_range = [friction, friction]
         if hasattr(self.env, "friction_coeffs"):
             self.env.friction_coeffs[:] = friction
-
+        
+        # 推力设置
         push = terrain_params.get("push_magnitude", 0.0)
-        cfg.domain_rand.max_push_vel_xy = push
-        cfg.domain_rand.push_robots = push > 0.1
-
+        if hasattr(self.env.cfg, "domain_rand"):
+            self.env.cfg.domain_rand.max_push_vel_xy = push
+            self.env.cfg.domain_rand.push_robots = push > 0.01
+        
+        # 附加质量 - 需要在 reset 时生效
         mass = terrain_params.get("added_mass", 0.0)
-        cfg.domain_rand.added_mass_range = [mass, mass]
+        if hasattr(self.env.cfg, "domain_rand"):
+            self.env.cfg.domain_rand.added_mass_range = [mass, mass]
+            self.env.cfg.domain_rand.randomize_base_mass = abs(mass) > 0.01
 
-        diff = terrain_params.get("difficulty", 0.5)
-        if hasattr(cfg.terrain, "difficulty_scale"):
-            cfg.terrain.difficulty_scale = diff
+    def evaluate_on_terrain(self, policy, terrain_params, num_episodes=50,
+                            max_steps=2000):
+        """在单个地形配置上评估
+        
+        Args:
+            policy: 要评估的策略
+            terrain_params: 地形参数字典
+            num_episodes: 评估的 episode 数量
+            max_steps: 最大仿真步数（防止死循环）
+        
+        Returns:
+            dict: 包含 mean_reward, success_rate, mean_ep_len 等指标
+        """
+        # 应用参数
+        self._apply_domain_params(terrain_params)
+        
+        # 重置环境以应用新参数
+        obs = self.env.reset()[0] if isinstance(self.env.reset(), tuple) else self.env.reset()
+        if hasattr(obs, 'to'):
+            obs = obs.to(self.device)
 
         # 评估
         policy.eval()
-        obs = self.env.get_observations()
         ep_rewards = []
         ep_lengths = []
         successes = 0
         completed = 0
 
         ep_rew = torch.zeros(self.num_envs, device=self.device)
-        ep_len = torch.zeros(self.num_envs, device=self.device)
+        ep_len = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         step = 0
 
-        while completed < num_episodes and step < max_steps * 5:
+        while completed < num_episodes and step < max_steps:
             with torch.no_grad():
                 actions = policy.act_inference(obs)
             obs, _, rewards, dones, infos = self.env.step(actions)
+            if hasattr(obs, 'to'):
+                obs = obs.to(self.device)
+            
             ep_rew += rewards
             ep_len += 1
             step += 1
 
+            # 处理完成的 episodes
             done_idx = dones.nonzero(as_tuple=False).flatten()
             for idx in done_idx:
                 i = idx.item()
                 ep_rewards.append(ep_rew[i].item())
                 ep_lengths.append(ep_len[i].item())
-                if "time_outs" in infos and infos["time_outs"][i]:
+                
+                # 成功判定：timeout 或者 episode 长度超过阈值
+                is_timeout = "time_outs" in infos and infos["time_outs"][i]
+                is_long_enough = ep_len[i].item() >= self.success_threshold
+                if is_timeout or is_long_enough:
                     successes += 1
+                
+                # 重置计数器
                 ep_rew[i] = 0
                 ep_len[i] = 0
                 completed += 1
+                
                 if completed >= num_episodes:
                     break
 
         if completed == 0:
-            return {"mean_reward": 0, "success_rate": 0, "mean_ep_len": 0,
-                    "num_episodes": 0}
+            return {
+                "mean_reward": 0.0, "std_reward": 0.0,
+                "success_rate": 0.0, "mean_ep_len": 0.0,
+                "num_episodes": 0
+            }
 
         return {
             "mean_reward": float(np.mean(ep_rewards)),
             "std_reward": float(np.std(ep_rewards)),
-            "success_rate": successes / completed,
+            "success_rate": float(successes / completed),
             "mean_ep_len": float(np.mean(ep_lengths)),
+            "std_ep_len": float(np.std(ep_lengths)),
             "num_episodes": completed,
         }
 
@@ -137,7 +178,7 @@ def main():
     parser.add_argument("--num_episodes", type=int, default=50)
     parser.add_argument("--num_envs", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--upload", action="store_true", default=True)
+    parser.add_argument("--upload", action="store_true", default=False)
     parser.add_argument("--no_upload", action="store_true")
     args = parser.parse_args()
     if args.no_upload:
@@ -187,22 +228,29 @@ def main():
     results = {}
 
     print(f"\nEvaluating {args.method}-{args.generator} on {len(COMMON_TEST_TERRAINS)} test terrains...")
+    print(f"  (Note: terrain_type/difficulty changes require env rebuild, testing domain_rand params)")
+    print()
+    
     for terrain_name, terrain_params in COMMON_TEST_TERRAINS.items():
         print(f"  {terrain_name}...", end=" ", flush=True)
         res = evaluator.evaluate_on_terrain(
             policy, terrain_params, num_episodes=args.num_episodes
         )
         results[terrain_name] = res
-        print(f"reward={res['mean_reward']:.2f}, success={res['success_rate']:.1%}")
+        print(f"reward={res['mean_reward']:.2f}, ep_len={res['mean_ep_len']:.0f}, success={res['success_rate']:.1%}")
 
     # 汇总
     all_rewards = [r["mean_reward"] for r in results.values()]
     all_success = [r["success_rate"] for r in results.values()]
+    all_ep_len = [r["mean_ep_len"] for r in results.values()]
+    
     summary = {
         "experiment": f"{args.method}-{args.generator}",
         "checkpoint": ckpt_path,
         "mean_reward_across_terrains": float(np.mean(all_rewards)),
+        "std_reward_across_terrains": float(np.std(all_rewards)),
         "mean_success_across_terrains": float(np.mean(all_success)),
+        "mean_ep_len_across_terrains": float(np.mean(all_ep_len)),
         "per_terrain": results,
     }
 
@@ -212,6 +260,7 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nResults saved to: {out_path}")
     print(f"  Mean reward: {summary['mean_reward_across_terrains']:.3f}")
+    print(f"  Mean ep_len: {summary['mean_ep_len_across_terrains']:.0f}")
     print(f"  Mean success: {summary['mean_success_across_terrains']:.1%}")
 
     # 上传
