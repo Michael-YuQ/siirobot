@@ -18,15 +18,15 @@ TRAIN_CFG = {
     "save_interval": 200,       # 每 200 iter 保存 checkpoint
     "upload_interval": 500,     # 每 500 iter 上传到服务器
     "eval_interval": 500,       # 每 500 iter 做一次中间评估
-    "curriculum_update_freq": 10,
+    "curriculum_update_freq": 50,   # v3: 从10改为50，给策略更多时间适应当前地形
     "ppo_lr": 1e-3,
     "generator_lr": 3e-4,
-    "novelty_threshold": 0.7,
+    "novelty_threshold": 0.95,      # v3: 从0.7改为0.95，放宽新颖性过滤
     "trajectory_buffer_size": 200,
-    "warmup_iterations": 50,
+    "warmup_iterations": 500,       # v3: 从50改为500，让机器狗先学会走路
     "easy_terrain_prob": 0.15,
-    "easy_terrain_decay": 0.995,
-    "min_easy_prob": 0.05,
+    "easy_terrain_decay": 0.998,    # v3: 从0.995改为0.998，衰减更慢
+    "min_easy_prob": 0.25,          # v3: 从0.05改为0.25，始终保留25%简单地形防遗忘
 }
 
 # ============================================================

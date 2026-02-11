@@ -331,20 +331,15 @@ def run_one_experiment(args):
         env.episode_length_buf, high=int(env.max_episode_length))
     stats_log = []
     start_time = time.time()
-    # PAIRED/ReMiDi original code uses freq=20, adversarial uses freq=10
-    if args.method == "atpc":
-        curriculum_freq = cfg["curriculum_update_freq"]  # 10
-    elif args.method == "paired":
-        curriculum_freq = 20  # match original PAIRED
-    else:
-        curriculum_freq = cfg["curriculum_update_freq"]
+    # All methods use same curriculum_freq now (50)
+    curriculum_freq = cfg["curriculum_update_freq"]
     for it in range(args.max_iterations):
         cur_stats = {}
         if use_adversarial and it % curriculum_freq == 0:
             params, is_easy, is_warmup, source = trainer.generate_and_apply()
             cur_stats = trainer.compute_and_update(params, is_easy, is_warmup, source)
-        # DR baseline: also evaluate solver periodically for fair comparison
-        if not use_adversarial and it % 50 == 0:
+        # DR baseline: evaluate solver periodically for fair comparison
+        if not use_adversarial and it % 10 == 0:
             with torch.no_grad():
                 policy = ppo_runner.alg.actor_critic
                 policy.eval()
@@ -367,26 +362,35 @@ def run_one_experiment(args):
             ppo_runner.alg.compute_returns(critic_obs)
         v_loss, s_loss = ppo_runner.alg.update()
         ep = env.extras.get("episode", {})
-        # Use total reward from episode sums, not specific reward component
+        # ---- reward logging (v3 fix) ----
+        # env.extras["episode"] contains episode sums as Tensors, need .item()
         mean_rew = 0.0
         if ep:
-            # Try common reward keys
             for key in ["rew_tracking_lin_vel", "reward", "r"]:
                 if key in ep:
                     val = ep[key]
-                    mean_rew = float(val) if isinstance(val, (int, float)) else 0.0
-                    break
-            if mean_rew == 0.0 and ep:
-                # Use first available reward key
-                for key, val in ep.items():
-                    if key.startswith("rew_") and isinstance(val, (int, float)):
+                    if hasattr(val, 'item'):
+                        mean_rew = val.mean().item() if val.dim() > 0 else val.item()
+                    elif isinstance(val, (int, float)):
                         mean_rew = float(val)
-                        break
-        # Also compute reward from env step rewards directly
+                    break
+            if mean_rew == 0.0:
+                for key, val in ep.items():
+                    if key.startswith("rew_"):
+                        if hasattr(val, 'item'):
+                            mean_rew = val.mean().item() if val.dim() > 0 else val.item()
+                        elif isinstance(val, (int, float)):
+                            mean_rew = float(val)
+                        if mean_rew != 0.0:
+                            break
+        # Direct env reward buffer — most reliable
         step_reward = env.rew_buf.mean().item() if hasattr(env, 'rew_buf') else 0.0
-        # Log available episode keys on first iteration
         if it == 0 and ep:
             print(f"[DEBUG] Available episode keys: {list(ep.keys())}")
+            for k, v in ep.items():
+                vtype = type(v).__name__
+                vshape = v.shape if hasattr(v, 'shape') else 'scalar'
+                print(f"  {k}: type={vtype} shape={vshape}")
         entry = {"iter": it, "reward": float(mean_rew), "step_reward": float(step_reward),
                  "v_loss": float(v_loss), "s_loss": float(s_loss), **cur_stats}
         stats_log.append(entry)
