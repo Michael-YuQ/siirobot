@@ -136,10 +136,10 @@ class PluggableAdversarialTrainer:
         if hasattr(cfg, "terrain") and hasattr(cfg.terrain, "difficulty_scale"):
             cfg.terrain.difficulty_scale = diff
 
-    def generate_and_apply(self):
-        if not self.warmup_done and self.warmup_count < self.warmup_iters:
+    def generate_and_apply(self, current_iter=0):
+        if not self.warmup_done and current_iter < self.warmup_iters:
             self.warmup_count += 1
-            if self.warmup_count >= self.warmup_iters:
+            if current_iter + 50 >= self.warmup_iters:  # next call will be past warmup
                 self.warmup_done = True
             params = self._random_easy_params()
             params["difficulty"] = float(np.random.uniform(0.1, 0.5))
@@ -336,7 +336,7 @@ def run_one_experiment(args):
     for it in range(args.max_iterations):
         cur_stats = {}
         if use_adversarial and it % curriculum_freq == 0:
-            params, is_easy, is_warmup, source = trainer.generate_and_apply()
+            params, is_easy, is_warmup, source = trainer.generate_and_apply(current_iter=it)
             cur_stats = trainer.compute_and_update(params, is_easy, is_warmup, source)
         # DR baseline: evaluate solver periodically for fair comparison
         if not use_adversarial and it % 10 == 0:
