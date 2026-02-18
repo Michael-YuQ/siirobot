@@ -98,7 +98,7 @@ class PluggableAdversarialTrainer:
                               self.ppo_runner.alg.actor_critic.parameters()):
                 pa.data.mul_(self.antagonist_ema).add_((1 - self.antagonist_ema) * ps.data)
 
-    def _evaluate_policy(self, policy, num_steps=24):
+    def _evaluate_policy(self, policy, num_steps=200):
         policy.eval()
         obs = self.env.get_observations()
         total_r = 0.0
@@ -188,14 +188,14 @@ class PluggableAdversarialTrainer:
 
     def compute_and_update(self, params, is_easy, is_warmup, source):
         self.iteration += 1
-        sol_r, sol_traj = self._evaluate_policy(self.ppo_runner.alg.actor_critic, num_steps=24)
+        sol_r, sol_traj = self._evaluate_policy(self.ppo_runner.alg.actor_critic, num_steps=200)
         if is_warmup:
             return {"solver_reward": sol_r, "regret": 0, "gen_loss": 0,
                     "is_novel": True, "accept_rate": 0, "source": source,
                     "easy_prob": self.current_easy_prob, **params}
         if self.antagonist is None:
             self._init_antagonist()
-        ant_r, _ = self._evaluate_policy(self.antagonist, num_steps=24)
+        ant_r, _ = self._evaluate_policy(self.antagonist, num_steps=200)
         regret = ant_r - sol_r
         gen_loss = 0.0
         is_novel = True
@@ -345,12 +345,12 @@ def run_one_experiment(args):
                 policy.eval()
                 eval_obs = env.get_observations()
                 eval_r = 0.0
-                for _ in range(24):
+                for _ in range(200):
                     act = policy.act_inference(eval_obs)
                     eval_obs, _, rew, _, _ = env.step(act)
                     eval_r += rew.mean().item()
                 policy.train()
-            cur_stats["solver_reward"] = eval_r / 24
+            cur_stats["solver_reward"] = eval_r / 200
             cur_stats["source"] = "DR"
         with torch.inference_mode():
             for _ in range(ppo_runner.num_steps_per_env):
