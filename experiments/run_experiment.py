@@ -72,6 +72,7 @@ class PluggableAdversarialTrainer:
         self.warmup_count = 0
         from legged_gym.curriculum.adversarial_trainer import FeasibilityFilter
         self.feasibility_filter = FeasibilityFilter()
+        self._eval_steps = c.get("eval_steps", 100)
         self.iteration = 0
         self.accepted = 0
         self.rejected = 0
@@ -98,7 +99,9 @@ class PluggableAdversarialTrainer:
                               self.ppo_runner.alg.actor_critic.parameters()):
                 pa.data.mul_(self.antagonist_ema).add_((1 - self.antagonist_ema) * ps.data)
 
-    def _evaluate_policy(self, policy, num_steps=200):
+    def _evaluate_policy(self, policy, num_steps=None):
+        if num_steps is None:
+            num_steps = self._eval_steps
         policy.eval()
         obs = self.env.get_observations()
         total_r = 0.0
@@ -188,14 +191,14 @@ class PluggableAdversarialTrainer:
 
     def compute_and_update(self, params, is_easy, is_warmup, source):
         self.iteration += 1
-        sol_r, sol_traj = self._evaluate_policy(self.ppo_runner.alg.actor_critic, num_steps=200)
+        sol_r, sol_traj = self._evaluate_policy(self.ppo_runner.alg.actor_critic)
         if is_warmup:
             return {"solver_reward": sol_r, "regret": 0, "gen_loss": 0,
                     "is_novel": True, "accept_rate": 0, "source": source,
                     "easy_prob": self.current_easy_prob, **params}
         if self.antagonist is None:
             self._init_antagonist()
-        ant_r, _ = self._evaluate_policy(self.antagonist, num_steps=200)
+        ant_r, _ = self._evaluate_policy(self.antagonist)
         regret = ant_r - sol_r
         gen_loss = 0.0
         is_novel = True
@@ -311,6 +314,9 @@ def run_one_experiment(args):
     train_cfg.runner.max_iterations = args.max_iterations
     train_cfg_dict = class_to_dict(train_cfg)
     ppo_runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.device)
+    # Override num_steps_per_env if specified in config
+    if "num_steps_per_env" in cfg:
+        ppo_runner.num_steps_per_env = cfg["num_steps_per_env"]
     if args.method == "dr":
         trainer = DRBaselineRunner(env, ppo_runner, log_dir)
         use_adversarial = False
@@ -339,18 +345,19 @@ def run_one_experiment(args):
             params, is_easy, is_warmup, source = trainer.generate_and_apply(current_iter=it)
             cur_stats = trainer.compute_and_update(params, is_easy, is_warmup, source)
         # DR baseline: evaluate solver periodically for fair comparison
-        if not use_adversarial and it % 10 == 0:
+        if not use_adversarial and it % cfg.get("dr_eval_freq", 50) == 0:
+            eval_steps = cfg.get("eval_steps", 100)
             with torch.no_grad():
                 policy = ppo_runner.alg.actor_critic
                 policy.eval()
                 eval_obs = env.get_observations()
                 eval_r = 0.0
-                for _ in range(200):
+                for _ in range(eval_steps):
                     act = policy.act_inference(eval_obs)
                     eval_obs, _, rew, _, _ = env.step(act)
                     eval_r += rew.mean().item()
                 policy.train()
-            cur_stats["solver_reward"] = eval_r / 200
+            cur_stats["solver_reward"] = eval_r / eval_steps
             cur_stats["source"] = "DR"
         with torch.inference_mode():
             for _ in range(ppo_runner.num_steps_per_env):
