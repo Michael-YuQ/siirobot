@@ -312,11 +312,11 @@ def run_one_experiment(args):
     from rsl_rl.runners import OnPolicyRunner
     _, train_cfg = task_registry.get_cfgs(name=task_name)
     train_cfg.runner.max_iterations = args.max_iterations
+    # Set num_steps_per_env BEFORE creating runner (rollout buffer is pre-allocated)
+    if "num_steps_per_env" in cfg:
+        train_cfg.runner.num_steps_per_env = cfg["num_steps_per_env"]
     train_cfg_dict = class_to_dict(train_cfg)
     ppo_runner = OnPolicyRunner(env, train_cfg_dict, log_dir, device=args.device)
-    # Override num_steps_per_env if specified in config
-    if "num_steps_per_env" in cfg:
-        ppo_runner.num_steps_per_env = cfg["num_steps_per_env"]
     if args.method == "dr":
         trainer = DRBaselineRunner(env, ppo_runner, log_dir)
         use_adversarial = False
